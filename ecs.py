@@ -10,12 +10,12 @@ from aws_cdk import (
     aws_s3
 )
 import aws_cdk as core
-​
-​
+
+
 class Pipeline(core.Stack):
     def __init__(self, app: core.App, id: str, props, **kwargs) -> None:
         super().__init__(app, id, **kwargs)
-​
+
         # create kms key policy statement
         kms_statement1 = aws_iam.PolicyStatement(
             effect=aws_iam.Effect.ALLOW,
@@ -33,7 +33,7 @@ class Pipeline(core.Stack):
                 "kms:DescribeKey",
             ],
         )
-​
+
         kms_statement2 = aws_iam.PolicyStatement(
             effect=aws_iam.Effect.ALLOW,
             resources=["*"],
@@ -49,18 +49,18 @@ class Pipeline(core.Stack):
             ],
             conditions={"Bool": {"kms:GrantIsForAWSResource": True}},
         )
-​
+
         kms_statement3 = aws_iam.PolicyStatement(
             effect=aws_iam.Effect.ALLOW,
             resources=["*"],
             principals=[aws_iam.ArnPrincipal("arn:aws:iam::245793655931:root")],
             actions=["kms:*"],
         )
-​
+
         kms_document = aws_iam.PolicyDocument(
             statements=[kms_statement1, kms_statement2, kms_statement3]
         )
-​
+
         # create a kms key for the S3 bucket
         kms_key = aws_kms.Key(
             self,
@@ -68,7 +68,7 @@ class Pipeline(core.Stack):
             alias=f"{props['namespace'].lower()}-{props['environments'][props['current_env']]['name']}",
             policy=kms_document,
         )
-​
+
         # pipeline requires versioned bucket
         ci_bucket = aws_s3.Bucket(
             self,
@@ -78,13 +78,13 @@ class Pipeline(core.Stack):
             encryption_key=kms_key,  # for xacct deployment
             removal_policy=core.RemovalPolicy.DESTROY,
         )
-​
+
         ecr_mio_mass_env = aws_ecr.Repository.from_repository_arn(
             self,
             f"ecr_mio_mass-{props['namespace']}-{props['environments'][props['current_env']]['name']}",
             repository_arn=props["ecr_mass_env_arn"],
         )
-​
+
         # create local ECR
         ecr = aws_ecr.Repository(
             self,
@@ -93,14 +93,14 @@ class Pipeline(core.Stack):
             image_scan_on_push=False,
             removal_policy=core.RemovalPolicy.DESTROY,
         )
-​
+
         # import ecr_remote repo in the remote account
         ecr_remote = aws_ecr.Repository.from_repository_arn(
             self,
             f"ecr-remote-{props['namespace'].lower()}-{props['environments'][props['current_env']]['name']}",
             repository_arn=f"arn:aws:ecr:us-east-1:{props['environments'][props['current_env']]['account_number']}:repository/ecr-{props['namespace']}-cd-{props['environments'][props['current_env']]['name']}",
         )
-​
+
         # codebuild project meant to run in pipeline
         cb_docker_build = aws_codebuild.PipelineProject(
             self,
@@ -160,7 +160,7 @@ class Pipeline(core.Stack):
             description="Pipeline for CodeBuild",
             timeout=core.Duration.minutes(60),
         )
-​
+
         # codebuild project meant to run in the pipeline - push image to the remote ECR repo
         cb_docker_build_push_remote = aws_codebuild.PipelineProject(
             self,
@@ -232,4 +232,179 @@ class Pipeline(core.Stack):
                 "ecr_image_env": aws_codebuild.BuildEnvironmentVariable(
                     value=props["current_env"]
                 ),
-                "remote_acccount": aws_codebuild.BuildEnvironm...
+                "remote_acccount": aws_codebuild.BuildEnvironmentVariable(
+                    value=props["environments"][props["current_env"]]["account_number"]
+                ),
+            },
+            description="Pipeline for CodeBuild push remote",
+            timeout=core.Duration.minutes(60),
+        )
+
+        # codebuild iam permissions to read write s3
+        ci_bucket.grant_read_write(cb_docker_build)
+
+        # create cross account policy statement
+        remote_iam_statement = aws_iam.PolicyStatement(
+            effect=aws_iam.Effect.ALLOW,
+            resources=[f"{props['environments'][props['current_env']]['cdk_role']}"],
+            actions=["sts:AssumeRole"],
+        )
+
+        # adding policy statement to docker build
+        cb_docker_build.role.add_to_policy(remote_iam_statement)
+        cb_docker_build_push_remote.role.add_to_policy(remote_iam_statement)
+
+        # codebuild permissions to interact with ecr
+        ecr_mio_mass_env.grant_pull(cb_docker_build)
+        ecr.grant_pull_push(cb_docker_build)
+        ecr_remote.grant_pull_push(cb_docker_build_push_remote)
+        ecr.grant_pull_push(cb_docker_build_push_remote)
+
+        # grant read access to the s3 bucket for the foreign account deployment role
+        ci_bucket.grant_read(
+            aws_iam.ArnPrincipal(
+                f"{props['environments'][props['current_env']]['cdk_role']}"
+            )
+        )
+
+        # create ssm parameter to get bucket name later
+        ci_bucket_param = aws_ssm.StringParameter(
+            self,
+            f"{props['namespace'].lower()}-{props['environments'][props['current_env']]['name']}-name-param",
+            parameter_name=f"{props['namespace'].lower()}-{props['environments'][props['current_env']]['account_number']}-{props['environments'][props['current_env']]['name']}",
+            string_value=ci_bucket.bucket_name,
+            description=f"{props['namespace'].lower()}-{props['environments'][props['current_env']]['account_number']}-{props['environments'][props['current_env']]['name']}-ci_bucket_name",
+        )
+
+        # container output
+        build_output = aws_codepipeline.Artifact(artifact_name="build")
+
+        # list of code commit repo that will be appended
+        code_commit_list = []
+
+        for data in props["environments"][props["current_env"]]["repo_list"]:
+            repo = aws_codecommit.Repository.from_repository_name(
+                self,
+                f"{data['repo_name']}-repo-{props['environments'][props['current_env']]['name']}",
+                repository_name=f"{data['repo_name']}",
+            )
+            # define the s3 artifact
+            source_output = aws_codepipeline.Artifact(
+                artifact_name=f"{data['repo_name'].replace('-', '_')}_source"
+            )
+
+            code_commit_list.append(
+                aws_codepipeline_actions.CodeCommitSourceAction(
+                    output=source_output,
+                    repository=repo,
+                    branch=data["branch"],
+                    action_name=f"CheckoutDocker{data['repo_name']}",
+                    run_order=1,
+                    variables_namespace=f"{props['namespace']}_{data['repo_name']}",
+                )
+            )
+
+        # define container output for hte deploy_remote
+        build_output_remote = aws_codepipeline.Artifact(
+            artifact_name="build_output_remote"
+        )
+
+        # retrieve s3 bucket encryption key created in the remote account, a string value
+        remote_bucket_key = aws_kms.Key.from_key_arn(
+            self,
+            f"{props['remote_namespace']}-SourceBucketKey-{props['environments'][props['current_env']]['name']}",
+            #########################////////need to be update per environment////////////////#################################
+            key_arn="arn:aws:kms:us-east-1:{props['environments'][props['current_env']]['account_number']}:key/4968aa87-e97e-4525-b9be-a5e5baf72f5b",
+        )
+
+        # using the bucket_string_value retrieved above to look up the S3 bucket
+        remote_bucket = aws_s3.Bucket.from_bucket_attributes(
+            self,
+            f"{props['remote_namespace']}-SourceBucket-{props['environments'][props['current_env']]['name']}",
+            # account = "409641887510",
+            # bucket_name = bucket_string_value,
+            account=f"{props['environments'][props['current_env']]['account_number']}",
+            #########################////////need to be update per environment////////////////#################################
+            # bucket_arn="arn:aws:s3:::dev-inv-mdr-ds-cd-dev",
+            bucket_arn=f"arn:aws:s3:::{props['namespace']}-cd-{props['environments'][props['current_env']]['name']}",
+            encryption_key=remote_bucket_key,
+        )
+
+        # define the pipeline
+        pipeline = aws_codepipeline.Pipeline(
+            self,
+            f"pipeline-{props['namespace']}-{props['environments'][props['current_env']]['name']}",
+            pipeline_name=f"pl-{props['namespace']}-{props['environments'][props['current_env']]['name']}",
+            cross_account_keys=True,
+            artifact_bucket=ci_bucket,
+            stages=[
+                aws_codepipeline.StageProps(
+                    stage_name="Source", actions=code_commit_list
+                ),
+                aws_codepipeline.StageProps(
+                    stage_name="Build",
+                    actions=[
+                        aws_codepipeline_actions.CodeBuildAction(
+                            action_name="DockerBuildImages",
+                            input=code_commit_list[0].action_properties.outputs[0],
+                            extra_inputs=list(
+                                map(
+                                    lambda x: x.action_properties.outputs[0],
+                                    code_commit_list[1::],
+                                )
+                            ),
+                            project=cb_docker_build,
+                            run_order=1,
+                            outputs=[build_output],
+                        )
+                    ],
+                ),
+                aws_codepipeline.StageProps(
+                    stage_name="BuildPushRemote",
+                    actions=[
+                        aws_codepipeline_actions.CodeBuildAction(
+                            action_name="DockerBuildImagesPushRemote",
+                            input=source_output,
+                            project=cb_docker_build_push_remote,
+                            outputs=[build_output_remote],
+                            run_order=1,
+                        )
+                    ],
+                ),
+                aws_codepipeline.StageProps(
+                    stage_name="deploy",
+                    actions=[
+                        aws_codepipeline_actions.S3DeployAction(
+                            action_name="Deploy",
+                            input=build_output_remote,
+                            bucket=remote_bucket,
+                            role=aws_iam.Role.from_role_arn(
+                                self,
+                                f"{props['remote_namespace']}-eba_role",
+                                role_arn=f"{props['environments'][props['current_env']]['cdk_role']}",
+                            ),
+                        )
+                    ],
+                ),
+            ],
+        )
+        # give pipelinerole read write to the bucket
+        ci_bucket.grant_read_write(pipeline.role)
+        ecr.grant_pull(pipeline.role)
+
+        # pipeline param to get the
+        pipeline_param = aws_ssm.StringParameter(
+            self,
+            f"pl-ssm-param-{props['namespace']}-{props['environments'][props['current_env']]['name']}",
+            parameter_name=f"{props['namespace']}-pipeline-{props['environments'][props['current_env']]['name']}",
+            string_value=pipeline.pipeline_name,
+            description="cdk pipeline bucket",
+        )
+
+        # cfn output
+        core.CfnOutput(
+            self,
+            f"pl-output-{props['namespace']}-{props['environments'][props['current_env']]['name']}",
+            description="Pipeline",
+            value=pipeline.pipeline_name,
+        )
